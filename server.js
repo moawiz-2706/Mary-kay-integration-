@@ -19,6 +19,13 @@
 const express    = require("express");
 const { chromium } = require("playwright");
 
+// Ensure Playwright can find its browser binaries on Render.com
+// Render sets HOME to /opt/render, so the default cache path is correct.
+// This line makes it explicit in case the env var is not set via render.yaml.
+if (!process.env.PLAYWRIGHT_BROWSERS_PATH) {
+  process.env.PLAYWRIGHT_BROWSERS_PATH = "/opt/render/.cache/ms-playwright";
+}
+
 const app  = express();
 const PORT = process.env.PORT || 3000;
 

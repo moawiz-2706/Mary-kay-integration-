@@ -3,7 +3,7 @@ services:
     name: mk-session-service
     env: node
     plan: starter          # Free tier works; upgrade to Starter ($7/mo) for always-on
-    buildCommand: npm install && npx playwright install chromium --with-deps
+    buildCommand: npm install && npx playwright install chromium && npx playwright install-deps chromium
     startCommand: npm start
     envVars:
       - key: API_SECRET_KEY
@@ -12,6 +12,8 @@ services:
         sync: false
       - key: MK_ACCOUNT_1_PASS
         sync: false
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: /opt/render/.cache/ms-playwright
       # Add more accounts as needed:
       # - key: MK_ACCOUNT_2_NUM
       #   sync: false
