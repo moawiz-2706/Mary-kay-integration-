@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: mk-session-service
+    env: docker           # Use Docker — this is the key change
+    plan: free            # Free tier
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: API_SECRET_KEY
+        sync: false
+      - key: MK_ACCOUNT_1_NUM
+        sync: false
+      - key: MK_ACCOUNT_1_PASS
+        sync: false
+      # The Puppeteer Docker image puts Chromium here
+      - key: PUPPETEER_EXECUTABLE_PATH
+        value: /usr/bin/google-chrome-stable
+      # Add more accounts as needed:
+      # - key: MK_ACCOUNT_2_NUM
+      #   sync: false
+      # - key: MK_ACCOUNT_2_PASS
+      #   sync: false
