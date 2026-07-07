@@ -1,23 +1,14 @@
 // =============================================================================
 // Mary Kay InTouch — Automated Session Service
 // Runs on Render.com (Node.js + Puppeteer)
-//
-// ENDPOINTS:
-//   GET  /health              — Health check (always public)
-//   GET  /get-session         — Returns fresh/cached session for a consultant
-//   POST /invalidate-session  — Forces a fresh login on next /get-session call
-//
-// ENVIRONMENT VARIABLES (set in Render Dashboard):
-//   API_SECRET_KEY            — A secret token your Apps Script sends to authenticate
-//   MK_ACCOUNT_<N>_NUM        — Consultant number, e.g. MK_ACCOUNT_1_NUM=JA7516
-//   MK_ACCOUNT_<N>_PASS       — Password,           e.g. MK_ACCOUNT_1_PASS=Wemhoff824!
-//   (Repeat for N = 1, 2, 3 ... for each consultant account)
 // =============================================================================
+
+require("dotenv").config();
 
 "use strict";
 
-const express    = require("express");
-const puppeteer  = require("puppeteer");
+const express   = require("express");
+const puppeteer = require("puppeteer");
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -25,7 +16,7 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 
 // =============================================================================
-// CONFIGURATION — loaded from environment variables
+// CONFIGURATION
 // =============================================================================
 
 const API_SECRET_KEY = process.env.API_SECRET_KEY || "";
@@ -53,8 +44,8 @@ console.log(`[Config] Loaded ${Object.keys(ACCOUNTS).length} account(s):`, Objec
 // IN-MEMORY SESSION CACHE
 // =============================================================================
 
-const sessionCache = {};
-const SESSION_TTL_MS = 23 * 60 * 60 * 1000; // 23 hours
+const sessionCache   = {};
+const SESSION_TTL_MS = 23 * 60 * 60 * 1000;
 
 function isCacheValid(consultantNum) {
   const entry = sessionCache[consultantNum];
@@ -63,7 +54,7 @@ function isCacheValid(consultantNum) {
 }
 
 // =============================================================================
-// MIDDLEWARE — API key authentication
+// MIDDLEWARE
 // =============================================================================
 
 function requireApiKey(req, res, next) {
@@ -75,8 +66,12 @@ function requireApiKey(req, res, next) {
   next();
 }
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 // =============================================================================
-// PUPPETEER LOGIN — extracts all session credentials
+// PUPPETEER LOGIN
 // =============================================================================
 
 async function loginAndGetSession(consultantNum, password) {
@@ -95,34 +90,48 @@ async function loginAndGetSession(consultantNum, password) {
   });
 
   const page = await browser.newPage();
-
   await page.setUserAgent(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
   );
 
-  // Storage for CSRF token captured via request interception
+  // Set up request interception FIRST — before any navigation
+  // so we capture csrf-token from every request including the initial page load
   let capturedCsrfToken = "";
+  await page.setRequestInterception(true);
+  page.on("request", (req) => {
+    const headers = req.headers();
+    const csrf    = headers["csrf-token"] || headers["x-csrf-token"] || "";
+    if (csrf && !capturedCsrfToken) {
+      capturedCsrfToken = csrf;
+      console.log(`[Login] CSRF token captured via request interception.`);
+    }
+    req.continue();
+  });
 
   try {
-    // ── Step 1: Navigate to login page ───────────────────────────────────────
+    // ── Step 1: Load the login page ───────────────────────────────────────────
     console.log(`[Login] Navigating to login page...`);
     await page.goto("https://mk.marykayintouch.com/s/login/?language=en_US", {
       waitUntil: "networkidle2",
       timeout:   60000
-    });
+    } );
 
     // ── Step 2: Fill credentials ──────────────────────────────────────────────
     console.log(`[Login] Filling credentials...`);
-    await page.waitForSelector('input[type="text"]', { timeout: 30000 });
-    await page.type('input[type="text"]',     consultantNum, { delay: 50 });
-    await page.type('input[type="password"]', password,      { delay: 50 });
+    await page.waitForSelector('input[type="text"]',     { timeout: 30000 });
+    await page.waitForSelector('input[type="password"]', { timeout: 30000 });
+    await page.type('input[type="text"]',     consultantNum, { delay: 60 });
+    await page.type('input[type="password"]', password,      { delay: 60 });
 
-    // ── Step 3: Submit and wait for redirect ──────────────────────────────────
+    // ── Step 3: Submit and wait for redirect chain to complete ────────────────
     console.log(`[Login] Submitting login form...`);
     await Promise.all([
       page.waitForNavigation({ waitUntil: "networkidle2", timeout: 60000 }),
       page.keyboard.press("Enter")
     ]);
+
+    // Allow any secondary redirects to settle
+    await sleep(3000);
 
     const postLoginUrl = page.url();
     console.log(`[Login] Post-login URL: ${postLoginUrl}`);
@@ -131,62 +140,82 @@ async function loginAndGetSession(consultantNum, password) {
       throw new Error("Login failed — still on login page. Check credentials.");
     }
 
-    // ── Step 4: Extract mk domain cookies ────────────────────────────────────
+    // ── Step 4: Wait for Aura framework to initialise ─────────────────────────
+    console.log(`[Login] Waiting for Aura framework...`);
+    try {
+      await page.waitForFunction(
+        () => typeof $A !== "undefined" && $A.clientService,
+        { timeout: 20000 }
+      );
+    } catch (e) {
+      console.warn(`[Login] Aura framework did not initialise in time — continuing anyway.`);
+    }
+
+    // ── Step 5: Extract mk domain cookies ────────────────────────────────────
     console.log(`[Login] Extracting mk domain cookies...`);
     const allCookies = await page.cookies();
     const mkCookies  = {};
     for (const c of allCookies) {
-      if (c.domain.includes("mk.marykayintouch.com") || c.domain.includes("marykayintouch.com")) {
-        mkCookies[c.name] = c.value;
-      }
+      mkCookies[c.name] = c.value;
     }
+    console.log(`[Login] mk cookies found: ${Object.keys(mkCookies).join(", ")}`);
 
-    // ── Step 5: Extract Aura token ────────────────────────────────────────────
+    // ── Step 6: Extract Aura token ────────────────────────────────────────────
     console.log(`[Login] Extracting Aura token...`);
     let mkAuraToken = "";
     try {
       mkAuraToken = await page.evaluate(() => {
-        try { return $A.clientService.Cc || ""; } catch (e) { return ""; }
+        try {
+          if ($A && $A.clientService && $A.clientService.Cc)    return $A.clientService.Cc;
+          if ($A && $A.clientService && $A.clientService.token) return $A.clientService.token;
+          return "";
+        } catch (e) { return ""; }
       });
     } catch (e) {
-      console.warn(`[Login] Aura token not found: ${e.message}`);
+      console.warn(`[Login] Aura token extraction failed: ${e.message}`);
     }
 
-    // ── Step 6: Navigate to apps domain ──────────────────────────────────────
-    console.log(`[Login] Navigating to apps domain...`);
+    // Fallback: scan the page HTML for an embedded token
+    if (!mkAuraToken) {
+      try {
+        const html  = await page.content();
+        const match = html.match(/"token"\s*:\s*"(eyJ[^"]+)"/);
+        if (match) { mkAuraToken = match[1]; console.log(`[Login] Aura token found in page HTML.`); }
+      } catch (e) {}
+    }
 
-    // Enable request interception to capture the csrf-token header
-    await page.setRequestInterception(true);
-    page.on("request", (req) => {
-      const headers = req.headers();
-      if (headers["csrf-token"] && !capturedCsrfToken) {
-        capturedCsrfToken = headers["csrf-token"];
-        console.log(`[Login] Captured CSRF token from request interception.`);
-      }
-      req.continue();
-    });
-
+    // ── Step 7: Navigate to apps domain (SAML SSO — multiple redirects) ──────
+    // Flow: apps.marykayintouch.com → saml/authn-request.jsp
+    //       → mk.marykayintouch.com (IdP POST)
+    //       → apps.marykayintouch.com/vforcesite/login
+    //       → apps.marykayintouch.com/customer-list
+    console.log(`[Login] Navigating to apps domain (SAML SSO)...`);
     await page.goto("https://apps.marykayintouch.com/customer-list", {
       waitUntil: "networkidle2",
-      timeout:   60000
-    });
+      timeout:   90000
+    } );
 
-    console.log(`[Login] Apps domain URL: ${page.url()}`);
+    // Extra wait for post-load JS and any deferred requests
+    await sleep(5000);
 
-    // ── Step 7: Extract apps domain cookies ───────────────────────────────────
+    const appsUrl = page.url();
+    console.log(`[Login] Final apps domain URL: ${appsUrl}`);
+
+    // ── Step 8: Extract apps domain cookies ───────────────────────────────────
     console.log(`[Login] Extracting apps domain cookies...`);
-    const appsCookiesRaw = await page.cookies();
+    const appsCookiesAll = await page.cookies();
     const appsCookies    = {};
-    for (const c of appsCookiesRaw) {
+    for (const c of appsCookiesAll) {
       if (c.domain.includes("apps.marykayintouch.com")) {
         appsCookies[c.name] = c.value;
       }
     }
+    console.log(`[Login] apps cookies found: ${Object.keys(appsCookies).join(", ")}`);
 
     const appsSid       = appsCookies["sid"]       || "";
     const appsBrowserId = appsCookies["BrowserId"] || mkCookies["BrowserId"] || "";
 
-    // ── Step 8: If CSRF not captured yet, trigger an apex call ────────────────
+    // ── Step 9: Trigger apex call to capture CSRF token if not yet captured ───
     if (!capturedCsrfToken) {
       console.log(`[Login] CSRF not captured yet — triggering apex call...`);
       try {
@@ -198,27 +227,31 @@ async function loginAndGetSession(consultantNum, password) {
               credentials: "include",
               headers:     { "Content-Type": "application/json; charset=utf-8" },
               body:        JSON.stringify({
-                namespace: "", classname: "CMT_CustomerListController",
-                method: "getRelatedCustomers", params: {},
-                cacheable: false, isContinuation: false
+                namespace:      "",
+                classname:      "CMT_CustomerListController",
+                method:         "getRelatedCustomers",
+                params:         {},
+                cacheable:      false,
+                isContinuation: false
               })
             }
           );
         });
-        await new Promise(r => setTimeout(r, 3000));
+        await sleep(4000);
       } catch (e) {
-        console.warn(`[Login] Apex call for CSRF failed: ${e.message}`);
+        console.warn(`[Login] Apex call failed: ${e.message}`);
       }
     }
 
+    // ── Step 10: Summary ──────────────────────────────────────────────────────
     console.log(`[Login] ─── Extraction Summary ───`);
-    console.log(`[Login] mk sid:       ${mkCookies["sid"]     ? mkCookies["sid"].substring(0,30)+"..."     : "MISSING"}`);
-    console.log(`[Login] apps sid:     ${appsSid              ? appsSid.substring(0,30)+"..."              : "MISSING"}`);
-    console.log(`[Login] auraToken:    ${mkAuraToken          ? mkAuraToken.substring(0,30)+"..."          : "MISSING"}`);
-    console.log(`[Login] csrfToken:    ${capturedCsrfToken    ? capturedCsrfToken.substring(0,30)+"..."    : "MISSING"}`);
+    console.log(`[Login] mk sid:    ${mkCookies["sid"]  ? mkCookies["sid"].substring(0,35)+"..."  : "MISSING"}`);
+    console.log(`[Login] apps sid:  ${appsSid           ? appsSid.substring(0,35)+"..."           : "MISSING"}`);
+    console.log(`[Login] auraToken: ${mkAuraToken       ? mkAuraToken.substring(0,35)+"..."       : "MISSING"}`);
+    console.log(`[Login] csrfToken: ${capturedCsrfToken ? capturedCsrfToken.substring(0,35)+"..." : "MISSING"}`);
 
     if (!mkCookies["sid"]) {
-      throw new Error("mk sid cookie not found after login — session may not have established.");
+      throw new Error("mk sid cookie not found — session did not establish correctly.");
     }
 
     return {
@@ -240,7 +273,6 @@ async function loginAndGetSession(consultantNum, password) {
 // ROUTES
 // =============================================================================
 
-// ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
   res.json({
     status:   "ok",
@@ -256,20 +288,13 @@ app.get("/health", (req, res) => {
   });
 });
 
-// ── Get session ───────────────────────────────────────────────────────────────
 app.get("/get-session", requireApiKey, async (req, res) => {
   const consultantNum = (req.query.consultantNum || "").trim().toUpperCase();
-
-  if (!consultantNum) {
-    return res.status(400).json({ error: "Missing required query param: consultantNum" });
-  }
+  if (!consultantNum) return res.status(400).json({ error: "Missing consultantNum" });
 
   const account = ACCOUNTS[consultantNum];
   if (!account) {
-    return res.status(404).json({
-      error:      `Consultant '${consultantNum}' is not configured on this server.`,
-      configured: Object.keys(ACCOUNTS)
-    });
+    return res.status(404).json({ error: `Consultant '${consultantNum}' not configured.`, configured: Object.keys(ACCOUNTS) });
   }
 
   if (isCacheValid(consultantNum)) {
@@ -283,22 +308,16 @@ app.get("/get-session", requireApiKey, async (req, res) => {
     sessionCache[consultantNum] = { session, fetchedAt: Date.now(), valid: true };
     return res.json({ ...session, fromCache: false });
   } catch (err) {
-    console.error(`[Session] Login failed for ${consultantNum}:`, err.message);
+    console.error(`[Session] Login failed:`, err.message);
     if (sessionCache[consultantNum]) sessionCache[consultantNum].valid = false;
     return res.status(500).json({ error: "Login failed", message: err.message });
   }
 });
 
-// ── Invalidate session ────────────────────────────────────────────────────────
 app.post("/invalidate-session", requireApiKey, (req, res) => {
   const consultantNum = (req.body.consultantNum || "").trim().toUpperCase();
-  if (!consultantNum) {
-    return res.status(400).json({ error: "Missing required body field: consultantNum" });
-  }
-  if (sessionCache[consultantNum]) {
-    sessionCache[consultantNum].valid = false;
-    console.log(`[Session] Invalidated cache for ${consultantNum}`);
-  }
+  if (!consultantNum) return res.status(400).json({ error: "Missing consultantNum" });
+  if (sessionCache[consultantNum]) sessionCache[consultantNum].valid = false;
   res.json({ success: true, message: `Session invalidated for ${consultantNum}` });
 });
 
@@ -307,9 +326,7 @@ app.post("/invalidate-session", requireApiKey, (req, res) => {
 // =============================================================================
 
 app.listen(PORT, () => {
-  console.log(`[Server] Mary Kay Session Service running on port ${PORT}`);
-  console.log(`[Server] Accounts: ${Object.keys(ACCOUNTS).join(", ") || "NONE — check env vars"}`);
-  if (!API_SECRET_KEY) {
-    console.warn("[Server] WARNING: API_SECRET_KEY is not set!");
-  }
+  console.log(`[Server] Running on port ${PORT}`);
+  console.log(`[Server] Accounts: ${Object.keys(ACCOUNTS).join(", ") || "NONE"}`);
+  if (!API_SECRET_KEY) console.warn("[Server] WARNING: API_SECRET_KEY is not set!");
 });
