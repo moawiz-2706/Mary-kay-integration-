@@ -2,18 +2,21 @@ services:
   - type: web
     name: mk-session-service
     env: node
-    plan: starter          # Free tier works; upgrade to Starter ($7/mo) for always-on
-    buildCommand: npm install && npx playwright install chromium && npx playwright install-deps chromium
+    plan: starter
+    # Puppeteer automatically downloads Chromium during npm/yarn install.
+    # No separate browser install step is needed — this is the key fix.
+    buildCommand: yarn install
     startCommand: npm start
     envVars:
       - key: API_SECRET_KEY
-        sync: false        # Set manually in Render Dashboard (never commit to git)
+        sync: false
       - key: MK_ACCOUNT_1_NUM
         sync: false
       - key: MK_ACCOUNT_1_PASS
         sync: false
-      - key: PLAYWRIGHT_BROWSERS_PATH
-        value: /opt/render/.cache/ms-playwright
+      # Puppeteer needs this on Render to skip the Chrome download check
+      - key: PUPPETEER_SKIP_CHROMIUM_DOWNLOAD
+        value: "false"
       # Add more accounts as needed:
       # - key: MK_ACCOUNT_2_NUM
       #   sync: false

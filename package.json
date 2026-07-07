@@ -5,14 +5,13 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js",
-    "postinstall": "npx playwright install chromium && npx playwright install-deps chromium"
+    "dev": "node server.js"
   },
   "engines": {
     "node": ">=18.0.0"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "playwright": "^1.44.0"
+    "puppeteer": "^22.0.0"
   }
 }
