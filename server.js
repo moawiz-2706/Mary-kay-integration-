@@ -213,30 +213,109 @@ async function loginAndGetSession(consultantNum, password) {
     const appsSid       = appsCookies["sid"]       || "";
     const appsBrowserId = appsCookies["BrowserId"] || mkCookies["BrowserId"] || "";
 
-    // ── Step 9: Trigger apex call to capture CSRF token if not yet captured ───
-    if (!capturedCsrfToken) {
-      console.log(`[Login] Triggering apex call to capture CSRF token...`);
+    // ── Step 9: Extract CSRF token from the page's LWR bootstrap context ─────
+// The fetch() approach via page.evaluate() bypasses Puppeteer's request
+// interceptor. Instead, we read the CSRF token directly from the page's
+// own JavaScript context where the LWR framework stores it after loading.
+if (!capturedCsrfToken) {
+  console.log(`[Login] Extracting CSRF token from LWR page context...`);
+  try {
+    // Method A: read from the LWR appConfig / bootstrap object
+    capturedCsrfToken = await page.evaluate(() => {
       try {
-        await page.evaluate(async () => {
-          await fetch(
-            "/webruntime/api/apex/execute?language=en-US&asGuest=false&htmlEncode=false",
-            {
-              method:      "POST",
-              credentials: "include",
-              headers:     { "Content-Type": "application/json; charset=utf-8" },
-              body:        JSON.stringify({
-                namespace: "", classname: "CMT_CustomerListController",
-                method: "getRelatedCustomers", params: {},
-                cacheable: false, isContinuation: false
-              })
-            }
-          );
-        });
-        await sleep(4000);
-      } catch (e) {
-        console.warn(`[Login] Apex call failed: ${e.message}`);
+        // LWR stores the CSRF token in window.appConfig or window.__lwr_app_config__
+        if (window.appConfig && window.appConfig.csrfToken)
+          return window.appConfig.csrfToken;
+        if (window.__lwr_app_config__ && window.__lwr_app_config__.csrfToken)
+          return window.__lwr_app_config__.csrfToken;
+        // Salesforce also stores it in a meta tag
+        const meta = document.querySelector('meta[name="csrf-token"]');
+        if (meta) return meta.getAttribute("content");
+        return "";
+      } catch (e) { return ""; }
+    });
+    if (capturedCsrfToken) {
+      console.log(`[Login] CSRF token found in LWR page context.`);
+    }
+  } catch (e) {
+    console.warn(`[Login] LWR context CSRF extraction failed: ${e.message}`);
+  }
+}
+
+// Method B: if still missing, scrape it from the raw HTML of the page
+if (!capturedCsrfToken) {
+  try {
+    const html = await page.content();
+    // LWR embeds the CSRF token as a JSON value in the inline bootstrap script
+    const patterns = [
+      /"csrfToken"\s*:\s*"([^"]+)"/,
+      /"csrf-token"\s*:\s*"([^"]+)"/,
+      /csrf[_-]?token['"]\s*:\s*['"]([^'"]+)['"]/i,
+      /name="csrf-token"\s+content="([^"]+)"/i
+    ];
+    for (const pattern of patterns) {
+      const match = html.match(pattern);
+      if (match && match[1]) {
+        capturedCsrfToken = match[1];
+        console.log(`[Login] CSRF token scraped from page HTML.`);
+        break;
       }
     }
+  } catch (e) {
+    console.warn(`[Login] HTML scrape for CSRF failed: ${e.message}`);
+  }
+}
+
+// Method C: use Puppeteer's own CDPSession to make the apex call so the
+// request interceptor CAN see it (unlike page.evaluate fetch)
+if (!capturedCsrfToken) {
+  console.log(`[Login] Attempting CDP-level apex call for CSRF token...`);
+  try {
+    const client = await page.target().createCDPSession();
+    const appsUrl = "https://apps.marykayintouch.com/webruntime/api/apex/execute?language=en-US&asGuest=false&htmlEncode=false";
+    const cookieHeader = (await page.cookies( ))
+      .filter(c => c.domain.includes("apps.marykayintouch.com"))
+      .map(c => `${c.name}=${c.value}`)
+      .join("; ");
+
+    const result = await client.send("Fetch.enable", {
+      patterns: [{ urlPattern: "*", requestStage: "Request" }]
+    });
+
+    const csrfPromise = new Promise((resolve) => {
+      client.on("Fetch.requestPaused", async (event) => {
+        const hdrs = event.request.headers || {};
+        const csrf = hdrs["csrf-token"] || hdrs["x-csrf-token"] || "";
+        if (csrf) resolve(csrf);
+        await client.send("Fetch.continueRequest", { requestId: event.requestId });
+      });
+      setTimeout(() => resolve(""), 8000);
+    });
+
+    await page.evaluate(async (url, cookieHdr) => {
+      await fetch(url, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        body: JSON.stringify({
+          namespace: "", classname: "CMT_CustomerListController",
+          method: "getRelatedCustomers", params: {},
+          cacheable: false, isContinuation: false
+        })
+      }).catch(() => {});
+    }, appsUrl, cookieHeader);
+
+    capturedCsrfToken = await csrfPromise;
+    await client.send("Fetch.disable");
+
+    if (capturedCsrfToken) {
+      console.log(`[Login] CSRF token captured via CDP Fetch interception.`);
+    }
+  } catch (e) {
+    console.warn(`[Login] CDP CSRF capture failed: ${e.message}`);
+  }
+}
+
 
     // ── Step 10: Summary ──────────────────────────────────────────────────────
     console.log(`[Login] ─── Extraction Summary ───`);
