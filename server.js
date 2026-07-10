@@ -248,19 +248,24 @@ if (!capturedCsrfToken) {
     const html = await page.content();
     // LWR embeds the CSRF token as a JSON value in the inline bootstrap script
     const patterns = [
-      /"csrfToken"\s*:\s*"([^"]+)"/,
-      /"csrf-token"\s*:\s*"([^"]+)"/,
-      /csrf[_-]?token['"]\s*:\s*['"]([^'"]+)['"]/i,
-      /name="csrf-token"\s+content="([^"]+)"/i
-    ];
-    for (const pattern of patterns) {
-      const match = html.match(pattern);
-      if (match && match[1]) {
-        capturedCsrfToken = match[1];
-        console.log(`[Login] CSRF token scraped from page HTML.`);
-        break;
-      }
+    // Must NOT match module paths like /webruntime/module/@app/csrfToken
+    // Real CSRF tokens are JWT-like strings (eyJ...) or long hex/alphanumeric strings
+    /"csrfToken"\s*:\s*"(eyJ[^"]{20,})"/,          // JWT format (eyJ...)
+    /"csrfToken"\s*:\s*"([a-zA-Z0-9+/=_\-]{32,})"/,// Base64/hex, min 32 chars, no slashes
+    /name="csrf-token"\s+content="([^"]+)"/i,        // meta tag
+    /"csrf-token"\s*:\s*"(eyJ[^"]{20,})"/,           // alternate key, JWT format
+    /"csrf-token"\s*:\s*"([a-zA-Z0-9+/=_\-]{32,})"/ // alternate key, base64/hex
+  ];
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    if (match && match[1] && !match[1].startsWith("/")) {
+      // Extra guard: skip anything that looks like a URL path
+      capturedCsrfToken = match[1];
+      console.log(`[Login] CSRF token scraped from page HTML.`);
+      break;
     }
+  }
+
   } catch (e) {
     console.warn(`[Login] HTML scrape for CSRF failed: ${e.message}`);
   }
