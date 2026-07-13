@@ -74,7 +74,7 @@ function sleep(ms) {
 // CSRF TOKEN EXTRACTION — DEFINITIVE HELPER
 // =============================================================================
 // Called after the apps domain page is fully loaded.
-// Uses 3 methods in order of reliability, stopping as soon as one succeeds.
+// Uses 4 methods in order of reliability, stopping as soon as one succeeds.
 //
 // WHY THIS IS RELIABLE:
 //   The apps.marykayintouch.com LWR (Lightning Web Runtime) page ALWAYS embeds
@@ -409,6 +409,74 @@ app.get("/health", (req, res) => {
   });
 });
 
+// =============================================================================
+// GET SESSION ROUTE — UPDATED CREDENTIAL RESOLUTION
+// =============================================================================
+// Credentials (consultantNum + password) can now be supplied in THREE ways,
+// checked in this priority order:
+//
+//   1. REQUEST BODY  — Google Apps Script sends them as JSON in the POST body:
+//                      { "consultantNum": "JA7516", "password": "Wemhoff824!" }
+//
+//   2. QUERY PARAMS  — passed directly in the URL (GET-style, less preferred):
+//                      /get-session?consultantNum=JA7516&password=Wemhoff824!
+//
+//   3. ENV VARS      — pre-configured on Render as MK_ACCOUNT_1_NUM / PASS
+//                      (original behaviour, still works as a fallback)
+//
+// The session cache key is always the consultant number (uppercased).
+// If credentials are supplied in the request, they are used for that login
+// but are NOT persisted to ACCOUNTS — they are only held in memory for the
+// duration of that single request.
+// =============================================================================
+
+app.post("/get-session", requireApiKey, async (req, res) => {
+  // ── Resolve consultantNum ─────────────────────────────────────────────────
+  const consultantNum = (
+    req.body.consultantNum   ||
+    req.query.consultantNum  ||
+    ""
+  ).trim().toUpperCase();
+
+  if (!consultantNum) {
+    return res.status(400).json({ error: "Missing consultantNum — provide it in the request body." });
+  }
+
+  // ── Resolve password ──────────────────────────────────────────────────────
+  // Priority: request body → query param → pre-configured env var account
+  const passwordFromRequest = (req.body.password || req.query.password || "").trim();
+  const passwordFromEnv     = (ACCOUNTS[consultantNum] || {}).password || "";
+  const password            = passwordFromRequest || passwordFromEnv;
+
+  if (!password) {
+    return res.status(400).json({
+      error: `No password found for consultant '${consultantNum}'. ` +
+             `Either send it in the request body as { "password": "..." } ` +
+             `or pre-configure MK_ACCOUNT_x_NUM / MK_ACCOUNT_x_PASS env vars on Render.`
+    });
+  }
+
+  // ── Serve from cache if valid ─────────────────────────────────────────────
+  if (isCacheValid(consultantNum)) {
+    console.log(`[Session] Returning cached session for ${consultantNum}`);
+    return res.json({ ...sessionCache[consultantNum].session, fromCache: true });
+  }
+
+  // ── Cache miss — perform fresh login ─────────────────────────────────────
+  console.log(`[Session] Cache miss — logging in for ${consultantNum}...`);
+  try {
+    const session = await loginAndGetSession(consultantNum, password);
+    sessionCache[consultantNum] = { session, fetchedAt: Date.now(), valid: true };
+    return res.json({ ...session, fromCache: false });
+  } catch (err) {
+    console.error(`[Session] Login failed:`, err.message);
+    if (sessionCache[consultantNum]) sessionCache[consultantNum].valid = false;
+    return res.status(500).json({ error: "Login failed", message: err.message });
+  }
+});
+
+// Keep the original GET route as well so existing Postman tests still work
+// when credentials are pre-configured in env vars
 app.get("/get-session", requireApiKey, async (req, res) => {
   const consultantNum = (req.query.consultantNum || "").trim().toUpperCase();
   if (!consultantNum) return res.status(400).json({ error: "Missing consultantNum" });
@@ -416,7 +484,8 @@ app.get("/get-session", requireApiKey, async (req, res) => {
   const account = ACCOUNTS[consultantNum];
   if (!account) {
     return res.status(404).json({
-      error:      `Consultant '${consultantNum}' not configured.`,
+      error:      `Consultant '${consultantNum}' not configured in env vars. ` +
+                  `Use POST /get-session with { consultantNum, password } in the body instead.`,
       configured: Object.keys(ACCOUNTS)
     });
   }
@@ -451,6 +520,6 @@ app.post("/invalidate-session", requireApiKey, (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`[Server] Running on port ${PORT}`);
-  console.log(`[Server] Accounts: ${Object.keys(ACCOUNTS).join(", ") || "NONE"}`);
+  console.log(`[Server] Accounts: ${Object.keys(ACCOUNTS).join(", ") || "NONE configured in env vars"}`);
   if (!API_SECRET_KEY) console.warn("[Server] WARNING: API_SECRET_KEY is not set!");
 });
