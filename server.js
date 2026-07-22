@@ -1,5 +1,6 @@
 // =============================================================================
 // Mary Kay InTouch — Automated Session Service
+// Version 9.0 — Complete Cookie Passthrough & Improved CSRF Handling
 // Runs on Render.com via Docker (Node.js + Puppeteer)
 // =============================================================================
 
@@ -71,10 +72,10 @@ function sleep(ms) {
 }
 
 // =============================================================================
-// CSRF TOKEN EXTRACTION — DEFINITIVE HELPER
+// CSRF TOKEN EXTRACTION — IMPROVED WITH DOMAIN-SCOPED CAPTURE
 // =============================================================================
 
-async function extractCsrfToken(page) {
+async function extractCsrfToken(page, appsUrl) {
 
   // ── Method A: Read from live DOM script tags (PRIMARY — most reliable) ──────
   try {
@@ -185,7 +186,7 @@ async function extractCsrfToken(page) {
 }
 
 // =============================================================================
-// PUPPETEER LOGIN
+// PUPPETEER LOGIN — IMPROVED: SSO REDIRECT VALIDATION & FULL COOKIE RETURN
 // =============================================================================
 
 async function loginAndGetSession(consultantNum, password) {
@@ -215,31 +216,39 @@ async function loginAndGetSession(consultantNum, password) {
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
   );
 
+  // ── Domain-scoped CSRF interception ────────────────────────────────────────
+  // Only capture CSRF tokens from requests going to the apps.marykayintouch.com domain.
+  // This prevents capturing stale or wrong-domain tokens from the mk. domain.
   let earlyInterceptedCsrf = "";
   await page.setRequestInterception(true);
   page.on("request", (req) => {
+    const url = req.url();
     const headers = req.headers();
-    const csrf    = headers["csrf-token"] || headers["x-csrf-token"] || "";
-    if (csrf && !earlyInterceptedCsrf) {
+    const csrf = headers["csrf-token"] || headers["x-csrf-token"] || "";
+    // Only capture CSRF from the apps domain (not the mk. domain)
+    if (csrf && !earlyInterceptedCsrf && url.includes("apps.marykayintouch.com")) {
       earlyInterceptedCsrf = csrf;
-      console.log(`[Login] CSRF token captured early via request interception.`);
+      console.log(`[Login] CSRF token captured via apps-domain request interception.`);
     }
     req.continue();
   });
 
   try {
+    // ── STEP 1: Navigate to login page ────────────────────────────────────────
     console.log(`[Login] Navigating to login page...`);
     await page.goto("https://mk.marykayintouch.com/s/login/?language=en_US", {
       waitUntil: "networkidle2",
       timeout:   60000
     });
 
+    // ── STEP 2: Fill credentials ──────────────────────────────────────────────
     console.log(`[Login] Filling credentials...`);
     await page.waitForSelector('input[type="text"]',     { timeout: 30000 });
     await page.waitForSelector('input[type="password"]', { timeout: 30000 });
     await page.type('input[type="text"]',     consultantNum, { delay: 60 });
     await page.type('input[type="password"]', password,      { delay: 60 });
 
+    // ── STEP 3: Submit login ──────────────────────────────────────────────────
     console.log(`[Login] Submitting login form...`);
     await Promise.all([
       page.waitForNavigation({ waitUntil: "networkidle2", timeout: 60000 }),
@@ -255,6 +264,7 @@ async function loginAndGetSession(consultantNum, password) {
       throw new Error("Login failed — still on login page. Check credentials.");
     }
 
+    // ── STEP 4: Wait for Aura framework ───────────────────────────────────────
     console.log(`[Login] Waiting for Aura framework...`);
     try {
       await page.waitForFunction(
@@ -265,12 +275,14 @@ async function loginAndGetSession(consultantNum, password) {
       console.warn(`[Login] Aura framework not ready — continuing anyway.`);
     }
 
+    // ── STEP 5: Extract mk domain cookies ─────────────────────────────────────
     console.log(`[Login] Extracting mk domain cookies...`);
     const allCookies = await page.cookies();
     const mkCookies  = {};
     for (const c of allCookies) mkCookies[c.name] = c.value;
     console.log(`[Login] mk cookies: ${Object.keys(mkCookies).join(", ")}`);
 
+    // ── STEP 6: Extract Aura token ────────────────────────────────────────────
     console.log(`[Login] Extracting Aura token...`);
     let mkAuraToken = "";
     try {
@@ -293,33 +305,55 @@ async function loginAndGetSession(consultantNum, password) {
       } catch (e) {}
     }
 
+    // ── STEP 7: Navigate to apps domain (SAML SSO) ───────────────────────────
     console.log(`[Login] Navigating to apps domain (SAML SSO)...`);
-    
-    // The key fix for the navigation timeout error:
-    // Some users experience timeouts here. Instead of throwing, we catch the timeout,
-    // verify if we reached the right domain, and continue.
-    try {
-      await page.goto("https://apps.marykayintouch.com/customer-list", {
-        waitUntil: "networkidle2",
-        timeout:   60000
-      });
-    } catch (e) {
-      console.warn(`[Login] Navigation to apps domain timed out or failed: ${e.message}`);
-      // If we made it to the apps domain despite the timeout, we can continue
-      if (!page.url().includes("apps.marykayintouch.com")) {
-        console.log(`[Login] Current URL is ${page.url()} - attempting reload...`);
-        try {
-          await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
-        } catch (reloadErr) {
-          console.warn(`[Login] Reload failed: ${reloadErr.message}`);
-        }
+
+    let appsPageReady = false;
+    let maxSsoRetries = 2;
+
+    for (let ssoAttempt = 1; ssoAttempt <= maxSsoRetries; ssoAttempt++) {
+      try {
+        await page.goto("https://apps.marykayintouch.com/customer-list", {
+          waitUntil: "networkidle2",
+          timeout:   60000
+        });
+      } catch (e) {
+        console.warn(`[Login] Navigation to apps domain timed out (attempt ${ssoAttempt}/${maxSsoRetries}): ${e.message}`);
       }
+
+      await sleep(5000);
+
+      const currentUrl = page.url();
+      console.log(`[Login] SSO attempt ${ssoAttempt}: Current URL = ${currentUrl}`);
+
+      // Check if we landed on the correct page (not a redirect/login flow page)
+      if (currentUrl.includes("apps.marykayintouch.com/customer-list") ||
+          (currentUrl.includes("apps.marykayintouch.com") && !currentUrl.includes("LoginIntouchFlow"))) {
+        appsPageReady = true;
+        console.log(`[Login] Apps page ready at: ${currentUrl}`);
+        break;
+      }
+
+      // If we're stuck on a login flow page, wait and retry
+      if (currentUrl.includes("LoginIntouchFlow") || currentUrl.includes("/login")) {
+        console.warn(`[Login] SSO redirect landed on auth flow page. Retrying...`);
+        await sleep(3000);
+        continue;
+      }
+
+      // We're on the apps domain but a different page — still acceptable
+      appsPageReady = true;
+      break;
     }
-    
-    await sleep(5000);
 
-    console.log(`[Login] Final apps URL: ${page.url()}`);
+    if (!appsPageReady) {
+      console.warn(`[Login] Warning: Apps page may not have loaded correctly after ${maxSsoRetries} attempts.`);
+    }
 
+    const finalAppsUrl = page.url();
+    console.log(`[Login] Final apps URL: ${finalAppsUrl}`);
+
+    // ── STEP 8: Extract ALL apps domain cookies ──────────────────────────────
     console.log(`[Login] Extracting apps domain cookies...`);
     const appsCookiesAll = await page.cookies();
     const appsCookies    = {};
@@ -328,12 +362,13 @@ async function loginAndGetSession(consultantNum, password) {
     }
     console.log(`[Login] apps cookies: ${Object.keys(appsCookies).join(", ")}`);
 
-    const appsSid       = appsCookies["sid"]       || "";
-    const appsBrowserId = appsCookies["BrowserId"] || mkCookies["BrowserId"] || "";
+    const appsSid = appsCookies["sid"] || "";
 
-    let capturedCsrfToken = earlyInterceptedCsrf;
+    // ── STEP 9: Extract CSRF token (only from apps domain) ───────────────────
+    // Clear earlyInterceptedCsrf if it was captured from a non-apps URL
+    let capturedCsrfToken = earlyInterceptedCsrf || "";
     if (!capturedCsrfToken) {
-      capturedCsrfToken = await extractCsrfToken(page);
+      capturedCsrfToken = await extractCsrfToken(page, finalAppsUrl);
     }
 
     console.log(`[Login] ─── Extraction Summary ───`);
@@ -345,23 +380,24 @@ async function loginAndGetSession(consultantNum, password) {
     if (!mkCookies["sid"]) {
       throw new Error("mk sid cookie not found — session did not establish correctly.");
     }
-    
-    // The second key fix: if apps session didn't establish properly, we shouldn't cache it as valid
-    // However, we still return what we have so the caller can decide what to do
+
     if (!appsSid || !capturedCsrfToken) {
       console.warn(`[Login] Warning: apps sid or csrf token missing. The apps session may be incomplete.`);
     }
 
+    // ── STEP 10: Return COMPLETE session data including all apps cookies ─────
+    // CRITICAL FIX: Return the full appsCookies object so the client script can
+    // send ALL required Salesforce cookies (including __Secure-has-sid, sid_Client, etc.)
     return {
-      consultantNum:  consultantNum,
-      mkCookies:      mkCookies,
-      mkAuraToken:    mkAuraToken,
-      appsSid:        appsSid,
-      appsBrowserId:  appsBrowserId,
-      appsCsrfToken:  capturedCsrfToken,
-      fetchedAt:      new Date().toISOString(),
-      // Add a flag indicating if the apps session is complete
-      appsSessionValid: !!(appsSid && capturedCsrfToken)
+      consultantNum:     consultantNum,
+      mkCookies:         mkCookies,
+      mkAuraToken:       mkAuraToken,
+      appsCookies:       appsCookies,      // FULL apps cookie dictionary
+      appsSid:           appsSid,          // Kept for backward compatibility
+      appsBrowserId:     appsCookies["BrowserId"] || mkCookies["BrowserId"] || "",
+      appsCsrfToken:     capturedCsrfToken,
+      fetchedAt:         new Date().toISOString(),
+      appsSessionValid:  !!(appsSid && capturedCsrfToken)
     };
 
   } finally {
@@ -419,11 +455,11 @@ app.post("/get-session", requireApiKey, async (req, res) => {
   console.log(`[Session] Cache miss — logging in for ${consultantNum}...`);
   try {
     const session = await loginAndGetSession(consultantNum, password);
-    
-    // Only cache if the mk session is valid (which loginAndGetSession guarantees if it doesn't throw)
-    // If appsSessionValid is false, we still cache it because other endpoints (Aura) only need mkCookies
+
+    // Cache the session. We cache even if appsSessionValid is false because
+    // the mk session (Aura) is still usable for other endpoints.
     sessionCache[consultantNum] = { session, fetchedAt: Date.now(), valid: true };
-    
+
     return res.json({ ...session, fromCache: false });
   } catch (err) {
     console.error(`[Session] Login failed:`, err.message);
